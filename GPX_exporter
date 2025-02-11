@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+import datetime
+import json
+import os
+import sys
+from getpass import getpass
+
+import readchar
+import logging
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+
+# Konfiguration des Loggings
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Standardwerte
+email = "MAILADDRESS"
+password = "PASSWORT"
+output_dir = "C:\\PFAD"
+os.makedirs(output_dir, exist_ok=True)
+
+
+def get_credentials():
+    """Fragt die Anmeldeinformationen des Benutzers ab."""
+    email = input("Garmin Login Email: ")
+    password = getpass("Garmin Passwort: ")
+    return email, password
+
+
+def safe_download(api, activity_id, format, retries=3):
+    """Sichere Download-Funktion mit Retry-Logik."""
+    for attempt in range(retries):
+        try:
+            return api.download_activity(activity_id, dl_fmt=format)
+        except Exception as err:
+            logger.warning(f"Attempt {attempt + 1} failed for activity {activity_id}: {err}")
+            time.sleep(5)  # Warte 5 Sekunden vor erneutem Versuch
+    logger.error(f"Failed to download activity {activity_id} after {retries} attempts.")
+    return None
+
+
+def is_activity_indoor(activity):
+    """Prüft, ob eine Aktivität Indoor ist oder explizit ausgeschlossen werden soll."""
+    # Überprüfe, ob "isIndoor" vorhanden ist und auf True gesetzt ist
+    if activity.get("isIndoor", False):
+        return True
+
+    # Überprüfe den Aktivitätstyp (falls verfügbar)
+    activity_type = activity.get("activityType", {}).get("typeKey", "").lower()
+    indoor_types = ["indoor_cycling", "indoor_rowing", "treadmill_running", "indoor_swimming"]
+    if activity_type in indoor_types:
+        return True
+
+    # Prüfe den Aktivitätsnamen auf typische Indoor-Begriffe oder spezifische Namen wie "Rudermaschine"
+    activity_name = activity.get("activityName", "").lower()
+    indoor_keywords = ["indoor", "cycling", "treadmill", "rowing", "elliptical", "trainer", "rudermaschine"]
+    if any(keyword in activity_name for keyword in indoor_keywords):
+        return True
+
+    # Standardmäßig ist die Aktivität nicht Indoor
+    return False
+
+
+def download_all_gpx_activities(api):
+    """Lädt alle verfügbaren Aktivitäten als GPX herunter und überspringt Indoor-Aktivitäten und bereits heruntergeladene."""
+    try:
+        print("\nDownloading all available activities...\n")
+        start = 0
+        limit = 100  # Garmin API gibt maximal 100 Aktivitäten pro Anfrage zurück
+        total_downloaded = 0
+        failed_activities = []
+
+        while True:
+            print(f"Fetching activities {start} to {start + limit}...")
+            activities = api.get_activities(start=start, limit=limit)
+
+            if not activities:
+                print("\nNo more activities found.")
+                break
+
+            for activity in activities:
+                activity_id = activity["activityId"]
+                activity_name = activity["activityName"]
+                activity_start_time = datetime.datetime.strptime(
+                    activity["startTimeLocal"], "%Y-%m-%d %H:%M:%S"
+                ).strftime("%d-%m-%Y")
+
+                # Prüfe, ob die Aktivität Indoor ist oder explizit ausgeschlossen werden soll
+                if is_activity_indoor(activity):
+                    print(f"Skipping indoor or excluded activity: {activity_name} ({activity_id})")
+                    continue
+
+                # Dateiname für die GPX-Datei
+                output_file = os.path.join(
+                    output_dir, f"{activity_name}_{activity_start_time}_{activity_id}.gpx"
+                )
+
+                # Überspringe bereits heruntergeladene Dateien
+                if os.path.exists(output_file):
+                    print(f"Skipping already downloaded activity: {output_file}")
+                    continue
+
+                print(f"Downloading GPX for activity {activity_name} ({activity_id})...")
+                gpx_data = safe_download(api, activity_id, api.ActivityDownloadFormat.GPX)
+                if gpx_data is None:
+                    print(f"Skipping activity {activity_id} due to repeated failures.")
+                    failed_activities.append(activity_id)
+                    continue
+
+                # Speichere die GPX-Datei
+                with open(output_file, "wb") as gpx_file:
+                    gpx_file.write(gpx_data)
+                print(f"Activity saved as {output_file}")
+                total_downloaded += 1
+
+            start += limit  # Nächste Seite von Aktivitäten
+
+        # Fehlgeschlagene Aktivitäten speichern
+        if failed_activities:
+            with open("failed_activities.txt", "w") as file:
+                for activity_id in failed_activities:
+                    file.write(f"{activity_id}\n")
+            print(f"\nFailed to download {len(failed_activities)} activities. Check 'failed_activities.txt'.")
+
+        print(f"\nTotal activities downloaded: {total_downloaded}")
+
+    except Exception as err:
+        logger.error(f"Error downloading activities: {err}")
+
+
+def main():
+    """Automatische Anmeldung und Download aller Aktivitäten."""
+    global email, password
+
+    # Login
+    try:
+        if not email or not password:
+            email, password = get_credentials()
+
+        api = Garmin(email, password)
+        api.login()
+    except GarminConnectAuthenticationError as auth_err:
+        logger.error(f"Authentication error: {auth_err}")
+        sys.exit(1)
+
+    # Lade alle Aktivitäten herunter
+    download_all_gpx_activities(api)
+
+    # Skript beenden
+    print("\nAll activities processed. Exiting...")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
