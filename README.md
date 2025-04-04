@@ -9,10 +9,9 @@ Clone the repo and run the script. This will create a `config.json`in which youl
 ## References
 
 The garminconnect library is used. 
-Thanks to the team of
-https://github.com/cyberjunky/python-garminconnect
+Thanks to the team of the [Python Garmin connect Library](https://github.com/cyberjunky/python-garminconnect)
 
-And thanks to WayPointDB 
-https://github.com/yniverz/WayPointDB
+And thanks to [WayPointDB](https://github.com/yniverz/WayPointDB)
+
 
 
