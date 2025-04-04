@@ -158,6 +158,7 @@ def post_gps_data(base_url, api_key, gps_data):
     payload = {"gps_data": gps_data}
 
     try:
+        print(url, params, payload)
         response = requests.post(url, params=params, json=payload)
         response.raise_for_status()
         print(f"Data successfully posted to {url} (status code: {response.status_code})")
