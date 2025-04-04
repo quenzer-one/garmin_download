@@ -3,76 +3,181 @@ import datetime
 import json
 import os
 import sys
-from getpass import getpass
-
-import readchar
+import time
 import logging
+import requests
+from getpass import getpass
 from garminconnect import (
     Garmin,
     GarminConnectAuthenticationError,
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
+from xml.etree import ElementTree as ET
 
-# Konfiguration des Loggings
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Standardwerte
-email = "MAILADDRESS"
-password = "PASSWORT"
-output_dir = "C:\\PFAD"
-os.makedirs(output_dir, exist_ok=True)
+CONFIG_FILE = "config.json"
+BASE_API_PATH = "/api/v1/gps/batch"  # <-- Statically defined path
 
+def create_default_config():
+    """Creates a default config.json if it does not exist."""
+    default_config = {
+        "email": "YOUR_GARMIN_EMAIL",
+        "password": "YOUR_GARMIN_PASSWORD",
+        "api_key": "YOUR_API_KEY",
+        "base_url": "https://example.com"   # Only the protocol + domain
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(default_config, f, indent=2)
 
-def get_credentials():
-    """Fragt die Anmeldeinformationen des Benutzers ab."""
-    email = input("Garmin Login Email: ")
-    password = getpass("Garmin Passwort: ")
-    return email, password
+def load_config():
+    """
+    Loads configuration from config.json.
+    If file doesn't exist, create a template and exit.
+    """
+    if not os.path.exists(CONFIG_FILE):
+        create_default_config()
+        print(f"Created '{CONFIG_FILE}'. Please fill it with valid data and run again.")
+        sys.exit(0)
 
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
 
-def safe_download(api, activity_id, format, retries=3):
-    """Sichere Download-Funktion mit Retry-Logik."""
+    # Basic validation check
+    if (not config.get("email") or config["email"] == "YOUR_GARMIN_EMAIL" or
+        not config.get("password") or config["password"] == "YOUR_GARMIN_PASSWORD" or
+        not config.get("api_key") or config["api_key"] == "YOUR_API_KEY" or
+        not config.get("base_url") or config["base_url"] == "https://example.com"):
+        print(f"Please fill out all fields in '{CONFIG_FILE}' before running again.")
+        sys.exit(0)
+
+    return config
+
+def safe_download(api, activity_id, dl_format, retries=3):
+    """Retry logic for downloading an activity."""
     for attempt in range(retries):
         try:
-            return api.download_activity(activity_id, dl_fmt=format)
+            return api.download_activity(activity_id, dl_fmt=dl_format)
         except Exception as err:
             logger.warning(f"Attempt {attempt + 1} failed for activity {activity_id}: {err}")
-            time.sleep(5)  # Warte 5 Sekunden vor erneutem Versuch
+            time.sleep(5)  # Wait 5 seconds before retry
     logger.error(f"Failed to download activity {activity_id} after {retries} attempts.")
     return None
 
-
 def is_activity_indoor(activity):
-    """Prüft, ob eine Aktivität Indoor ist oder explizit ausgeschlossen werden soll."""
-    # Überprüfe, ob "isIndoor" vorhanden ist und auf True gesetzt ist
+    """Checks if an activity is Indoor or explicitly excluded."""
+    # Check if "isIndoor" is present and True
     if activity.get("isIndoor", False):
         return True
 
-    # Überprüfe den Aktivitätstyp (falls verfügbar)
+    # Check activityType
     activity_type = activity.get("activityType", {}).get("typeKey", "").lower()
     indoor_types = ["indoor_cycling", "indoor_rowing", "treadmill_running", "indoor_swimming"]
     if activity_type in indoor_types:
         return True
 
-    # Prüfe den Aktivitätsnamen auf typische Indoor-Begriffe oder spezifische Namen wie "Rudermaschine"
+    # Check activity name for typical indoor keywords
     activity_name = activity.get("activityName", "").lower()
     indoor_keywords = ["indoor", "cycling", "treadmill", "rowing", "elliptical", "trainer", "rudermaschine"]
     if any(keyword in activity_name for keyword in indoor_keywords):
         return True
 
-    # Standardmäßig ist die Aktivität nicht Indoor
     return False
 
+def parse_gpx_to_json(gpx_data):
+    """
+    Given raw GPX data (bytes), parse out each trackpoint's:
+      - time (converted to epoch seconds),
+      - latitude,
+      - longitude,
+    and any optional fields with sensible defaults.
+    """
+    ns = {
+        'default': 'http://www.topografix.com/GPX/1/1',
+        'ns3': 'http://www.garmin.com/xmlschemas/TrackPointExtension/v1'
+    }
+    root = ET.fromstring(gpx_data)
 
-def download_all_gpx_activities(api):
-    """Lädt alle verfügbaren Aktivitäten als GPX herunter und überspringt Indoor-Aktivitäten und bereits heruntergeladene."""
+    # Find all trackpoints
+    trackpoints = root.findall('.//default:trkpt', ns)
+    gps_data = []
+
+    for trkpt in trackpoints:
+        # Extract lat/lon
+        lat = trkpt.get('lat')
+        lon = trkpt.get('lon')
+
+        if lat is None or lon is None:
+            continue
+        lat = float(lat)
+        lon = float(lon)
+
+        # Extract time
+        time_elem = trkpt.find('default:time', ns)
+        if time_elem is None or not time_elem.text:
+            # If there's no time, skip
+            continue
+        
+        # Convert time from ISO8601 to epoch seconds
+        try:
+            timestamp_seconds = int(datetime.datetime.fromisoformat(
+                time_elem.text.replace('Z', '+00:00')
+            ).timestamp())
+        except ValueError:
+            # If parsing fails, skip
+            continue
+
+        # Optional: extract elevation (ele) and set as altitude
+        ele_elem = trkpt.find('default:ele', ns)
+        altitude = float(ele_elem.text) if ele_elem is not None else 0.0
+
+        # Construct the dictionary for this trackpoint
+        point_data = {
+            "timestamp": str(timestamp_seconds),
+            "latitude": lat,
+            "longitude": lon,
+            # Optional fields (defaults)
+            "horizontal_accuracy": 0,
+            "altitude": altitude,
+            "vertical_accuracy": 0,
+            "heading": 0,
+            "heading_accuracy": 0,
+            "speed": 0,
+            "speed_accuracy": 0
+        }
+        gps_data.append(point_data)
+
+    return gps_data
+
+def post_gps_data(base_url, api_key, gps_data):
+    """
+    Posts the GPS data to the specified endpoint with `api_key` as a GET parameter.
+    The path '/api/v1/gps/batch' is statically appended.
+    """
+    url = base_url.rstrip('/') + BASE_API_PATH
+    params = {"api_key": api_key}
+    payload = {"gps_data": gps_data}
+
+    try:
+        response = requests.post(url, params=params, json=payload)
+        response.raise_for_status()
+        print(f"Data successfully posted to {url} (status code: {response.status_code})")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error posting data to {url}: {e}")
+
+def download_and_send_activities(api, base_url, api_key):
+    """
+    Retrieves all activities from Garmin, filters out indoor/excluded,
+    downloads GPX for each, parses it, and sends it to the given API.
+    """
     try:
         print("\nDownloading all available activities...\n")
         start = 0
-        limit = 100  # Garmin API gibt maximal 100 Aktivitäten pro Anfrage zurück
-        total_downloaded = 0
+        limit = 100
+        total_sent = 0
         failed_activities = []
 
         while True:
@@ -86,75 +191,67 @@ def download_all_gpx_activities(api):
             for activity in activities:
                 activity_id = activity["activityId"]
                 activity_name = activity["activityName"]
-                activity_start_time = datetime.datetime.strptime(
-                    activity["startTimeLocal"], "%Y-%m-%d %H:%M:%S"
-                ).strftime("%d-%m-%Y")
 
-                # Prüfe, ob die Aktivität Indoor ist oder explizit ausgeschlossen werden soll
+                # Skip indoor activities
                 if is_activity_indoor(activity):
                     print(f"Skipping indoor or excluded activity: {activity_name} ({activity_id})")
-                    continue
-
-                # Dateiname für die GPX-Datei
-                output_file = os.path.join(
-                    output_dir, f"{activity_name}_{activity_start_time}_{activity_id}.gpx"
-                )
-
-                # Überspringe bereits heruntergeladene Dateien
-                if os.path.exists(output_file):
-                    print(f"Skipping already downloaded activity: {output_file}")
                     continue
 
                 print(f"Downloading GPX for activity {activity_name} ({activity_id})...")
                 gpx_data = safe_download(api, activity_id, api.ActivityDownloadFormat.GPX)
                 if gpx_data is None:
-                    print(f"Skipping activity {activity_id} due to repeated failures.")
+                    print(f"Skipping activity {activity_id} due to repeated download failures.")
                     failed_activities.append(activity_id)
                     continue
 
-                # Speichere die GPX-Datei
-                with open(output_file, "wb") as gpx_file:
-                    gpx_file.write(gpx_data)
-                print(f"Activity saved as {output_file}")
-                total_downloaded += 1
+                # Parse GPX into JSON
+                gps_data = parse_gpx_to_json(gpx_data)
+                if not gps_data:
+                    print(f"No valid trackpoints found for activity {activity_id}. Skipping.")
+                    continue
 
-            start += limit  # Nächste Seite von Aktivitäten
+                # Send data to the endpoint
+                post_gps_data(base_url, api_key, gps_data)
+                total_sent += len(gps_data)
 
-        # Fehlgeschlagene Aktivitäten speichern
+            start += limit  # Move to next batch
+
+        # If any failed activities, log them
         if failed_activities:
             with open("failed_activities.txt", "w") as file:
-                for activity_id in failed_activities:
-                    file.write(f"{activity_id}\n")
-            print(f"\nFailed to download {len(failed_activities)} activities. Check 'failed_activities.txt'.")
+                for act_id in failed_activities:
+                    file.write(f"{act_id}\n")
+            print(f"\nFailed to download {len(failed_activities)} activities. See 'failed_activities.txt'.")
 
-        print(f"\nTotal activities downloaded: {total_downloaded}")
+        print(f"\nTotal trackpoints sent: {total_sent}")
 
     except Exception as err:
-        logger.error(f"Error downloading activities: {err}")
-
+        logger.error(f"Error processing activities: {err}")
 
 def main():
-    """Automatische Anmeldung und Download aller Aktivitäten."""
-    global email, password
+    """Main entry point."""
+    # Load config or create a default one
+    config = load_config()
 
-    # Login
+    email = config["email"]
+    password = config["password"]
+    api_key = config["api_key"]
+    base_url = config["base_url"]
+
+    # Log in to Garmin
     try:
-        if not email or not password:
-            email, password = get_credentials()
-
         api = Garmin(email, password)
         api.login()
+        print("Successfully logged in to Garmin.\n")
     except GarminConnectAuthenticationError as auth_err:
         logger.error(f"Authentication error: {auth_err}")
         sys.exit(1)
 
-    # Lade alle Aktivitäten herunter
-    download_all_gpx_activities(api)
+    # Download and send all activities
+    download_and_send_activities(api, base_url, api_key)
 
-    # Skript beenden
     print("\nAll activities processed. Exiting...")
     sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
