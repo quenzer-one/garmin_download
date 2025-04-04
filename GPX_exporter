@@ -122,13 +122,9 @@ def parse_gpx_to_json(gpx_data):
             continue
         
         # Convert time from ISO8601 to epoch seconds
-        try:
-            timestamp_seconds = int(datetime.datetime.fromisoformat(
-                time_elem.text.replace('Z', '+00:00')
-            ).timestamp())
-        except ValueError:
-            # If parsing fails, skip
-            continue
+        timestamp_seconds = int(datetime.datetime.fromisoformat(
+            time_elem.text[:-5] + "Z"
+        ).timestamp())
 
         # Optional: extract elevation (ele) and set as altitude
         ele_elem = trkpt.find('default:ele', ns)
