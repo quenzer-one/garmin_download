@@ -148,13 +148,7 @@ def parse_gpx_to_json(gpx_data):
             "timestamp": str(timestamp_seconds),  # Stored as string
             "latitude": lat,
             "longitude": lon,
-            "horizontal_accuracy": 0,
             "altitude": altitude,
-            "vertical_accuracy": 0,
-            "heading": 0,
-            "heading_accuracy": 0,
-            "speed": 0,
-            "speed_accuracy": 0
         }
         gps_data.append(point_data)
 
