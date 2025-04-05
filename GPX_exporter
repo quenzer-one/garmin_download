@@ -28,7 +28,8 @@ def create_default_config():
         "email": "YOUR_GARMIN_EMAIL",
         "password": "YOUR_GARMIN_PASSWORD",
         "api_key": "YOUR_API_KEY",
-        "base_url": "https://example.com"   # Only the protocol + domain
+        "base_url": "https://example.com",   # Only the protocol + domain
+        "last_uploaded_time": 0              # ADDED FOR LAST UPLOADED TIME
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(default_config, f, indent=2)
@@ -54,7 +55,19 @@ def load_config():
         print(f"Please fill out all fields in '{CONFIG_FILE}' before running again.")
         sys.exit(0)
 
+    # ADDED FOR LAST UPLOADED TIME - If key doesn't exist, initialize it
+    if "last_uploaded_time" not in config:
+        config["last_uploaded_time"] = 0
+
     return config
+
+# ADDED FOR LAST UPLOADED TIME
+def save_config(config):
+    """
+    Overwrite the config.json with current config data (including last_uploaded_time).
+    """
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
 
 def safe_download(api, activity_id, dl_format, retries=3):
     """Retry logic for downloading an activity."""
@@ -132,10 +145,9 @@ def parse_gpx_to_json(gpx_data):
 
         # Construct the dictionary for this trackpoint
         point_data = {
-            "timestamp": str(timestamp_seconds),
+            "timestamp": str(timestamp_seconds),  # Stored as string
             "latitude": lat,
             "longitude": lon,
-            # Optional fields (defaults)
             "horizontal_accuracy": 0,
             "altitude": altitude,
             "vertical_accuracy": 0,
@@ -148,6 +160,19 @@ def parse_gpx_to_json(gpx_data):
 
     return gps_data
 
+# ADDED FOR LAST UPLOADED TIME
+def filter_by_last_uploaded_time(gps_data, last_uploaded_time):
+    """
+    Given gps_data (list of dicts) and a last_uploaded_time (int),
+    return only the points whose timestamp > last_uploaded_time.
+    """
+    filtered = []
+    for point in gps_data:
+        ts = int(point["timestamp"])  # convert string to int
+        if ts > last_uploaded_time:
+            filtered.append(point)
+    return filtered
+
 def post_gps_data(base_url, api_key, gps_data):
     """
     Posts the GPS data to the specified endpoint with `api_key` as a GET parameter.
@@ -158,17 +183,20 @@ def post_gps_data(base_url, api_key, gps_data):
     payload = {"gps_data": gps_data}
 
     try:
-        print(url, params, payload)
+        print(url, params, "[%d trackpoints]" % len(gps_data))
         response = requests.post(url, params=params, json=payload)
         response.raise_for_status()
         print(f"Data successfully posted to {url} (status code: {response.status_code})")
+        return True
     except requests.exceptions.RequestException as e:
         logger.error(f"Error posting data to {url}: {e}")
+        return False
 
-def download_and_send_activities(api, base_url, api_key):
+def download_and_send_activities(api, base_url, api_key, config):
     """
     Retrieves all activities from Garmin, filters out indoor/excluded,
     downloads GPX for each, parses it, and sends it to the given API.
+    Also skips trackpoints older than `config["last_uploaded_time"]`.
     """
     try:
         print("\nDownloading all available activities...\n")
@@ -176,6 +204,9 @@ def download_and_send_activities(api, base_url, api_key):
         limit = 100
         total_sent = 0
         failed_activities = []
+
+        # ADDED FOR LAST UPLOADED TIME
+        last_uploaded_time = config["last_uploaded_time"]
 
         while True:
             print(f"Fetching activities {start} to {start + limit}...")
@@ -207,9 +238,23 @@ def download_and_send_activities(api, base_url, api_key):
                     print(f"No valid trackpoints found for activity {activity_id}. Skipping.")
                     continue
 
+                # ADDED FOR LAST UPLOADED TIME: filter out points older/equal to last_uploaded_time
+                new_points = filter_by_last_uploaded_time(gps_data, last_uploaded_time)
+                if not new_points:
+                    print(f"All points in activity {activity_id} are older than last uploaded time. Skipping.")
+                    continue
+
                 # Send data to the endpoint
-                post_gps_data(base_url, api_key, gps_data)
-                total_sent += len(gps_data)
+                success = post_gps_data(base_url, api_key, new_points)
+                if success:
+                    # ADDED FOR LAST UPLOADED TIME: update the config with new max timestamp
+                    max_ts = max(int(p["timestamp"]) for p in new_points)
+                    if max_ts > last_uploaded_time:
+                        last_uploaded_time = max_ts
+                        config["last_uploaded_time"] = last_uploaded_time
+                        save_config(config)  # Save after each successful post
+
+                    total_sent += len(new_points)
 
             start += limit  # Move to next batch
 
@@ -245,7 +290,7 @@ def main():
         sys.exit(1)
 
     # Download and send all activities
-    download_and_send_activities(api, base_url, api_key)
+    download_and_send_activities(api, base_url, api_key, config)
 
     print("\nAll activities processed. Exiting...")
     sys.exit(0)
